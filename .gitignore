@@ -68,3 +68,5 @@ Thumbs.db
 *sublime*
 # Added entries (1 items)
 *.exe
+# PT backup directory
+.pt/
