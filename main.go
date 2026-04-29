@@ -1,13 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -17,23 +15,12 @@ import (
 	"github.com/gookit/color"
 	"github.com/shirou/gopsutil/v3/process"
 	"github.com/urfave/cli/v2"
-	"golang.org/x/sys/unix"
 )
-
-// ─── terminal width ────────────────────────────────────────────────────────────
-
-func termWidth() int {
-	ws, err := unix.IoctlGetWinsize(int(os.Stdout.Fd()), unix.TIOCGWINSZ)
-	if err != nil || ws.Col == 0 {
-		return 120
-	}
-	return int(ws.Col)
-}
 
 // ─── text wrap ────────────────────────────────────────────────────────────────
 
 func wrapText(text, prefix string) string {
-	maxWidth := termWidth()
+	maxWidth := termWidth() // platform-specific
 	re := regexp.MustCompile(`([A-Z_]+\s+:\s*)$`)
 	continuationPrefix := prefix
 	if m := re.FindStringIndex(prefix); m != nil {
@@ -77,7 +64,7 @@ func wrapText(text, prefix string) string {
 	return strings.Join(lines, "\n"+continuationPrefix)
 }
 
-// ─── global no-color flag ─────────────────────────────────────────────────────
+// ─── global flags ─────────────────────────────────────────────────────────────
 
 var noColor bool
 
@@ -116,7 +103,7 @@ func rCounter(s string) string { return cHexB("#55FF00", s) }
 func rParentLabel() string     { return cHexB("#FF00FF", "PARENT:") }
 func rChildLabel() string      { return cHexB("#00FF00", "CHILD:") }
 
-// ─── network connections ───────────────────────────────────────────────────────
+// ─── NetConn (shared between platforms) ──────────────────────────────────────
 
 type NetConn struct {
 	Fd     string `json:"fd"`
@@ -129,84 +116,9 @@ type NetConn struct {
 	Status string `json:"status"`
 }
 
-func hexToIPv4(h string) string {
-	n, _ := strconv.ParseUint(h, 16, 32)
-	return fmt.Sprintf("%d.%d.%d.%d", n&0xff, (n>>8)&0xff, (n>>16)&0xff, (n>>24)&0xff)
-}
-
-var tcpStates = map[string]string{
-	"01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV",
-	"04": "FIN_WAIT1", "05": "FIN_WAIT2", "06": "TIME_WAIT",
-	"07": "CLOSE", "08": "CLOSE_WAIT", "09": "LAST_ACK",
-	"0A": "LISTEN", "0B": "CLOSING", "00": "NONE",
-}
-
-func getConnections(pid int32) []NetConn {
-	inodeToFd := map[string]string{}
-	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
-	if entries, err := os.ReadDir(fdDir); err == nil {
-		for _, e := range entries {
-			link, err := os.Readlink(filepath.Join(fdDir, e.Name()))
-			if err == nil && strings.HasPrefix(link, "socket:[") {
-				inode := strings.TrimSuffix(strings.TrimPrefix(link, "socket:["), "]")
-				inodeToFd[inode] = e.Name()
-			}
-		}
-	}
-	var results []NetConn
-	for _, proto := range []string{"tcp", "udp", "tcp6", "udp6"} {
-		f, err := os.Open(fmt.Sprintf("/proc/net/%s", proto))
-		if err != nil {
-			continue
-		}
-		scanner := bufio.NewScanner(f)
-		scanner.Scan()
-		for scanner.Scan() {
-			fields := strings.Fields(scanner.Text())
-			if len(fields) < 10 {
-				continue
-			}
-			inode := fields[9]
-			fd, ok := inodeToFd[inode]
-			if !ok {
-				continue
-			}
-			lp := strings.Split(fields[1], ":")
-			rp := strings.Split(fields[2], ":")
-			if len(lp) < 2 || len(rp) < 2 {
-				continue
-			}
-			state := strings.ToUpper(fields[3])
-			stateStr, ok2 := tcpStates[state]
-			if !ok2 {
-				stateStr = state
-			}
-			family := "AF_INET"
-			if strings.HasSuffix(proto, "6") {
-				family = "AF_INET6"
-			}
-			connType := "TCP"
-			if strings.HasPrefix(proto, "udp") {
-				connType = "UDP"
-			}
-			lIP := hexToIPv4(lp[0])
-			rIP := hexToIPv4(rp[0])
-			lPort, _ := strconv.ParseUint(lp[1], 16, 32)
-			rPort, _ := strconv.ParseUint(rp[1], 16, 32)
-			results = append(results, NetConn{
-				Fd: fd, Family: family, Type: connType,
-				Laddr: lIP, Lport: int(lPort),
-				Raddr: rIP, Rport: int(rPort),
-				Status: stateStr,
-			})
-		}
-		f.Close()
-	}
-	return results
-}
-
+// checkPort checks if the process uses a given port (local or remote).
 func checkPort(pid int32, port int) bool {
-	for _, c := range getConnections(pid) {
+	for _, c := range getConnections(pid) { // platform-specific
 		if c.Lport == port || c.Rport == port {
 			return true
 		}
@@ -276,27 +188,31 @@ func gather(p *process.Process) (*ProcInfo, error) {
 	}
 	name, _ := p.Name()
 	exe, _ := p.Exe()
-	cmd, _ := p.Cmdline()
-	cwd, _ := p.Cwd()
+	rawCmd, _ := p.Cmdline()
+	rawCwd, _ := p.Cwd()
 	user, _ := p.Username()
 	cpu, _ := p.CPUPercent()
 	running, _ := p.IsRunning()
 	ct, _ := p.CreateTime()
+
+	// Platform-aware CMD/CWD resolution:
+	// On Windows, sandboxed processes (Chrome renderers, etc.) block gopsutil's
+	// NtQueryInformationProcess read. getCmdlineCwd() falls back to direct
+	// ReadProcessMemory on the PEB, then dirname(exe) as last resort.
+	// On Linux, getCmdlineCwd() is a no-op passthrough.
+	cmd, cwd := getCmdlineCwd(p.Pid, rawCmd, rawCwd, exe)
+
 	return &ProcInfo{
 		Pid: p.Pid, Name: name, Exe: exe, Cmd: cmd,
 		Cwd: cwd, User: user,
 		MemMB:     float64(mem.RSS) / 1024 / 1024,
-		CPU:       cpu, Running: running,
-		StartTime: fmtTime(ct),
+		CPU:       cpu,
+		Running:   running,
+		StartTime: fmtStartTimeMS(ct), // platform-specific, includes milliseconds
 		Conns:     getConnections(p.Pid),
 	}, nil
 }
 
-func fmtTime(ms int64) string {
-	return time.Unix(ms/1000, 0).Format("06/01/02 15:04:05")
-}
-
-// fieldEnabled returns true if the field is in the allowed set (or set is empty = all).
 func fieldEnabled(fields map[string]bool, name string) bool {
 	if len(fields) == 0 {
 		return true
@@ -304,18 +220,14 @@ func fieldEnabled(fields map[string]bool, name string) bool {
 	return fields[strings.ToLower(name)]
 }
 
-// renderBlock builds the coloured info block for one process.
 func renderBlock(info *ProcInfo, prefix, detailPrefix string, fields map[string]bool) string {
 	var sb strings.Builder
-
-	// header line always shown
 	sb.WriteString(fmt.Sprintf("%s%s [%s] %s %s %s\n",
 		prefix,
 		rName(info.Name), rPidBadge(fmt.Sprintf("%d", info.Pid)),
 		rMemBadge(fmt.Sprintf("%.2f MB", info.MemMB)),
 		rUserBadge(info.User), rRunning(info.Running),
 	))
-
 	if fieldEnabled(fields, "start_time") && info.StartTime != "" {
 		sb.WriteString(fmt.Sprintf("%sSTART_TIME : %s\n", detailPrefix, info.StartTime))
 	}
@@ -374,10 +286,7 @@ func getParents(pid int32, depth int) []*process.Process {
 	return parents
 }
 
-func getChildren(pid int32, all []*process.Process, depth int) []*process.Process {
-	if depth == 0 {
-		return nil
-	}
+func getChildren(pid int32, all []*process.Process) []*process.Process {
 	var out []*process.Process
 	for _, p := range all {
 		ppid, err := p.Ppid()
@@ -388,7 +297,8 @@ func getChildren(pid int32, all []*process.Process, depth int) []*process.Proces
 	return out
 }
 
-func renderTree(procs []*process.Process, netOnly bool, baseIndent string, fields map[string]bool, depth, maxDepth int, all []*process.Process) {
+func renderTree(procs []*process.Process, netOnly bool, baseIndent string,
+	fields map[string]bool, depth, maxDepth int, all []*process.Process) {
 	if maxDepth > 0 && depth >= maxDepth {
 		return
 	}
@@ -408,10 +318,8 @@ func renderTree(procs []*process.Process, netOnly bool, baseIndent string, field
 			continue
 		}
 		fmt.Print(renderBlock(info, baseIndent+treeChar, baseIndent+detailChar, fields))
-
-		// recurse into children of this tree node
 		if all != nil {
-			grandChildren := getChildren(p.Pid, all, maxDepth-depth)
+			grandChildren := getChildren(p.Pid, all)
 			if len(grandChildren) > 0 {
 				renderTree(grandChildren, netOnly, baseIndent+detailChar, fields, depth+1, maxDepth, all)
 			}
@@ -422,7 +330,7 @@ func renderTree(procs []*process.Process, netOnly bool, baseIndent string, field
 // ─── no-process banner ────────────────────────────────────────────────────────
 
 func printNoProcess() {
-	colors := []string{
+	hexColors := []string{
 		"#FF0000", "#00FF00", "#0000FF", "#FFFF00", "#FF00FF", "#00FFFF",
 		"#FF5555", "#55FF55", "#5555FF", "#FFFF55", "#FF55FF", "#55FFFF",
 	}
@@ -430,7 +338,7 @@ func printNoProcess() {
 	fmt.Print("😞 🚯 😵 😂 🎸 🎵️ ⛔ ☣️ 🔜 ")
 	for _, ch := range "N-O  P-R-O-C-E-S-S  F-O-U-N-D" {
 		if ch != ' ' {
-			fmt.Print(color.HEX(colors[rand.Intn(len(colors))], true).Sprint(string(ch)))
+			fmt.Print(color.HEX(hexColors[rand.Intn(len(hexColors))], true).Sprint(string(ch)))
 		} else {
 			fmt.Print(" ")
 		}
@@ -452,7 +360,6 @@ func printTable(rows [][]string, fields map[string]bool) {
 			colIdx = append(colIdx, i)
 		}
 	}
-
 	widths := make([]int, len(headers))
 	for i, h := range headers {
 		widths[i] = len(h)
@@ -471,7 +378,6 @@ func printTable(rows [][]string, fields map[string]bool) {
 			}
 		}
 	}
-
 	sep := "+"
 	for _, w := range widths {
 		sep += strings.Repeat("-", w+2) + "+"
@@ -487,7 +393,6 @@ func printTable(rows [][]string, fields map[string]bool) {
 		}
 		fmt.Println()
 	}
-
 	fmt.Println(sep)
 	printRow(headers)
 	fmt.Println(sep)
@@ -533,12 +438,14 @@ type ListOpts struct {
 
 func listProcesses(opts ListOpts) {
 	selfPid := int32(os.Getpid())
-	allProcs, err := process.Processes()
+
+	allProcs, err := getAllProcesses() // platform-specific (no WMI on Windows)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error listing processes:", err)
 		return
 	}
 
+	// exclude self
 	var procs []*process.Process
 	for _, p := range allProcs {
 		if p.Pid != selfPid {
@@ -563,7 +470,7 @@ func listProcesses(opts ListOpts) {
 		procs = filtered
 	}
 
-	// pid filter (direct PID lookup)
+	// direct PID lookup
 	if opts.PidFilter > 0 {
 		var filtered []*process.Process
 		for _, p := range procs {
@@ -642,7 +549,7 @@ func listProcesses(opts ListOpts) {
 		// name/pid/cmd filter
 		if opts.Filter != "" {
 			fl := strings.ToLower(opts.Filter)
-			pidStr := fmt.Sprintf("%d", p.Pid)
+			pidStr := strconv.Itoa(int(p.Pid))
 			nameMatch := strings.Contains(strings.ToLower(name), fl)
 			pidMatch := strings.Contains(pidStr, fl)
 			cmdMatch := !opts.NoFilterCmd && strings.Contains(strings.ToLower(cmd), fl)
@@ -658,6 +565,12 @@ func listProcesses(opts ListOpts) {
 
 		info, err := gather(p)
 		if err != nil {
+			// Print error inline like Python — process died mid-scan
+			ct2, _ := p.CreateTime()
+			n2, _ := p.Name()
+			st2 := fmtStartTimeMS(ct2)
+			fmt.Printf("\nError retrieving process info: %v (pid=%d, name=%q)\n    START_TIME : %s\n\n",
+				err, p.Pid, n2, st2)
 			continue
 		}
 
@@ -693,7 +606,7 @@ func listProcesses(opts ListOpts) {
 				parents = getParents(p.Pid, opts.TreeDepth)
 			}
 			if opts.ShowChild && !opts.NoTree {
-				children = getChildren(p.Pid, allProcs, opts.TreeDepth)
+				children = getChildren(p.Pid, allProcs)
 			}
 			entries = append(entries, entry{counter, info, parents, children})
 		}
@@ -734,7 +647,6 @@ func listProcesses(opts ListOpts) {
 				lines[0] = rCounter(fmt.Sprintf("%03d.", e.n)) + " " + lines[0]
 			}
 			fmt.Print(strings.Join(lines, "\n"))
-
 			if len(e.parents) > 0 {
 				fmt.Printf("    %s\n", rParentLabel())
 				renderTree(e.parents, opts.ShowNetOnly, "    ", opts.Fields, 0, opts.TreeDepth, nil)
@@ -763,9 +675,8 @@ func listProcesses(opts ListOpts) {
 
 func watchLoop(interval int, opts ListOpts) {
 	for {
-		// clear screen
 		fmt.Print("\033[H\033[2J")
-		fmt.Printf("%s  %s  interval: %ds  press Ctrl+C to exit\n\n",
+		fmt.Printf("%s  %s  interval: %ds  Ctrl+C to exit\n\n",
 			cHexB("#00FFFF", "● WATCH MODE"),
 			cHexB("#FFFF00", time.Now().Format("2006/01/02 15:04:05")),
 			interval,
@@ -795,7 +706,7 @@ func doKill(p *process.Process) {
 }
 
 func killProcess(filter string, lastN int, sortDesc bool, portFilter int, force bool) {
-	allProcs, _ := process.Processes()
+	allProcs, _ := getAllProcesses()
 	if portFilter > 0 {
 		var matched []*process.Process
 		for _, p := range allProcs {
@@ -886,7 +797,7 @@ func restartProcess(p *process.Process) {
 }
 
 func restartByFilter(filter string, lastN int, sortDesc bool, portFilter int) {
-	allProcs, _ := process.Processes()
+	allProcs, _ := getAllProcesses()
 	if portFilter > 0 {
 		var matched []*process.Process
 		for _, p := range allProcs {
@@ -899,7 +810,7 @@ func restartByFilter(filter string, lastN int, sortDesc bool, portFilter int) {
 			return
 		}
 		if len(matched) > 1 {
-			color.Red.Printf("Multiple processes found using port %d. Please be more specific.\n", portFilter)
+			color.Red.Printf("Multiple processes found using port %d. Be more specific.\n", portFilter)
 			return
 		}
 		restartProcess(matched[0])
@@ -941,7 +852,7 @@ func restartByFilter(filter string, lastN int, sortDesc bool, portFilter int) {
 	color.Red.Println("No matching process found to restart.")
 }
 
-// ─── parse fields flag ────────────────────────────────────────────────────────
+// ─── helpers ──────────────────────────────────────────────────────────────────
 
 func parseFields(raw string) map[string]bool {
 	if raw == "" {
@@ -960,13 +871,13 @@ func main() {
 	app := &cli.App{
 		Name:    "pl",
 		Usage:   "Process List Viewer",
-		Version: "7.1.0",
+		Version: "7.2.0",
 		Authors: []*cli.Author{
 			{Name: "Hadi Cahyadi", Email: "cumulus13@gmail.com"},
 		},
-		Description: cHexB("#00AAFF", "Fast, colorful process inspector — network, parent/child tree, kill, restart, watch & JSON."),
+		Description: cHexB("#00AAFF", "Fast, colorful process inspector — network, parent/child tree, kill, restart, watch & JSON.\nWindows: uses EnumProcesses+iphlpapi (no WMI). Linux: reads /proc directly."),
 		Flags: []cli.Flag{
-			// ── original flags (all preserved) ──
+			// ── original flags ──
 			&cli.StringFlag{Name: "filter", Aliases: []string{"f"}, Usage: "Filter by process `NAME`, PID, or cmdline"},
 			&cli.IntFlag{Name: "port", Aliases: []string{"p"}, Usage: "Filter processes by `PORT` number (local or remote)"},
 			&cli.BoolFlag{Name: "list", Aliases: []string{"l"}, Usage: "List processes"},
@@ -992,7 +903,7 @@ func main() {
 			&cli.IntFlag{Name: "depth", Aliases: []string{"d"}, Usage: "Limit parent/child tree `DEPTH` (0 = unlimited)"},
 			&cli.BoolFlag{Name: "json", Aliases: []string{"j"}, Usage: "Output results as JSON"},
 			&cli.IntFlag{Name: "watch", Aliases: []string{"w"}, Usage: "Auto-refresh every `N` seconds (watch mode)"},
-			&cli.StringFlag{Name: "fields", Usage: "Comma-separated fields to show: name,pid,exe,mem,cmd,cpu,user,cwd,net,start_time"},
+			&cli.StringFlag{Name: "fields", Usage: "Comma-separated fields: name,pid,exe,mem,cmd,cpu,user,cwd,net,start_time"},
 			&cli.BoolFlag{Name: "no-color", Usage: "Disable color output"},
 		},
 		Action: func(c *cli.Context) error {
@@ -1010,7 +921,7 @@ func main() {
 
 			doList := c.Bool("list") || c.Bool("all") || filter != "" ||
 				portFilter > 0 || pidFilter > 0 || c.Bool("network") ||
-				c.Bool("networks") || c.Int("last") > 0
+				c.Bool("networks") || lastN > 0
 
 			opts := ListOpts{
 				Filter:      filter,
