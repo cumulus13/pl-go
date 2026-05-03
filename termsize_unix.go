@@ -1,3 +1,9 @@
+// File: termsize_unix.go
+// Author: Hadi Cahyadi <cumulus13@gmail.com>
+// Date: 2026-05-03
+// Description: 
+// License: MIT
+
 //go:build !windows
 
 package main

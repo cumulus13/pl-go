@@ -1,3 +1,9 @@
+// File: net_windows.go
+// Author: Hadi Cahyadi <cumulus13@gmail.com>
+// Date: 2026-05-03
+// Description: 
+// License: MIT
+
 //go:build windows
 
 package main
@@ -10,7 +16,7 @@ import (
 	"unsafe"
 )
 
-// Uses GetExtendedTcpTable / GetExtendedUdpTable from iphlpapi.dll
+// Uses GetExtendedTcpTable / GetExtendedUdpTable from iphlpapi.dll.
 // Zero WMI. Same low-level API that netstat.exe uses.
 
 var (
@@ -85,8 +91,29 @@ func getTableBytes(proc *syscall.LazyProc, tableClass, family uint32) ([]byte, e
 	return buf, nil
 }
 
+// connKey is used to deduplicate UDP entries (same port/addr binding on
+// multiple interfaces — e.g. Chrome's mDNS port 5353 appears once per NIC).
+type connKey struct {
+	connType string
+	family   string
+	laddr    string
+	lport    int
+	raddr    string
+	rport    int
+	status   string
+}
+
 func getConnections(pid int32) []NetConn {
 	var results []NetConn
+	seen := map[connKey]bool{}
+
+	addConn := func(c NetConn) {
+		k := connKey{c.Type, c.Family, c.Laddr, c.Lport, c.Raddr, c.Rport, c.Status}
+		if !seen[k] {
+			seen[k] = true
+			results = append(results, c)
+		}
+	}
 
 	// ── TCP IPv4 ──────────────────────────────────────────────────────────────
 	if buf, err := getTableBytes(procGetExtendedTcpTable, tcpTableOwnerPidAll, afInet); err == nil {
@@ -105,14 +132,21 @@ func getConnections(pid int32) []NetConn {
 			if stateName == "" {
 				stateName = fmt.Sprintf("STATE_%d", row.State)
 			}
-			results = append(results, NetConn{
-				Fd:     "-1", // Windows has no per-socket fd — match Python's -1
+			raddr := u32ToIP(row.RemoteAddr)
+			rport := winPort(row.RemotePort)
+			// For LISTEN state, remote is meaningless — show N/A like Python
+			if stateName == "LISTEN" || (raddr == "0.0.0.0" && rport == 0) {
+				raddr = "N/A"
+				rport = -1
+			}
+			addConn(NetConn{
+				Fd:     "-1",
 				Family: "AF_INET",
 				Type:   "TCP",
 				Laddr:  u32ToIP(row.LocalAddr),
 				Lport:  winPort(row.LocalPort),
-				Raddr:  u32ToIP(row.RemoteAddr),
-				Rport:  winPort(row.RemotePort),
+				Raddr:  raddr,
+				Rport:  rport,
 				Status: stateName,
 			})
 		}
@@ -131,14 +165,15 @@ func getConnections(pid int32) []NetConn {
 			if int32(row.OwningPID) != pid {
 				continue
 			}
-			results = append(results, NetConn{
+			// UDP has no remote addr — show N/A to match Python psutil output
+			addConn(NetConn{
 				Fd:     "-1",
 				Family: "AF_INET",
 				Type:   "UDP",
 				Laddr:  u32ToIP(row.LocalAddr),
 				Lport:  winPort(row.LocalPort),
-				Raddr:  "0.0.0.0",
-				Rport:  0,
+				Raddr:  "N/A",
+				Rport:  -1,
 				Status: "NONE",
 			})
 		}
@@ -174,14 +209,19 @@ func getConnections(pid int32) []NetConn {
 			}
 			lIP := net.IP(row.LocalAddr[:]).String()
 			rIP := net.IP(row.RemoteAddr[:]).String()
-			results = append(results, NetConn{
+			rport := winPort(row.RemotePort)
+			if stateName == "LISTEN" || rport == 0 {
+				rIP = "N/A"
+				rport = -1
+			}
+			addConn(NetConn{
 				Fd:     "-1",
 				Family: "AF_INET6",
 				Type:   "TCP",
 				Laddr:  lIP,
 				Lport:  winPort(row.LocalPort),
 				Raddr:  rIP,
-				Rport:  winPort(row.RemotePort),
+				Rport:  rport,
 				Status: stateName,
 			})
 		}
@@ -207,14 +247,14 @@ func getConnections(pid int32) []NetConn {
 				continue
 			}
 			lIP := net.IP(row.LocalAddr[:]).String()
-			results = append(results, NetConn{
+			addConn(NetConn{
 				Fd:     "-1",
 				Family: "AF_INET6",
 				Type:   "UDP",
 				Laddr:  lIP,
 				Lport:  winPort(row.LocalPort),
-				Raddr:  "::",
-				Rport:  0,
+				Raddr:  "N/A",
+				Rport:  -1,
 				Status: "NONE",
 			})
 		}

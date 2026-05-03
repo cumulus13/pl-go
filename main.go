@@ -1,3 +1,9 @@
+// File: main.go
+// Author: Hadi Cahyadi <cumulus13@gmail.com>
+// Date: 2026-05-03
+// Description: 
+// License: MIT
+
 package main
 
 import (
@@ -84,22 +90,22 @@ func cBg(fg, bg, text string) string { return maybeColor(func(s string) string {
 func rName(s string) string      { return cHexB("#00FFFF", s) }
 func rPidBadge(s string) string  { return cBg("#FFFFFF", "#55007F", s) }
 func rMemBadge(s string) string  { return cBg("#FF0000", "#FFAA7F", s) }
-func rUserBadge(s string) string { return cHexB("#00AAFF", s) }
+func rUserBadge(s string) string { return cHex("#5555FF", s) }
 func rRunning(ok bool) string {
 	if ok {
-		return cHexB("#FFFF00", "(running)")
+		return cHex("#FFFF00", "(running)")
 	}
 	return cBg("#FFFFFF", "#FF0000", "???")
 }
-func rNameVal(s string) string { return cHexB("#00AAFF", s) }
+func rNameVal(s string) string { return cHex("#00AAFF", s) }
 func rPidVal(s string) string  { return cBg("#FFFFFF", "#550000", s) }
-func rExeVal(s string) string  { return cHexB("#AAAA7F", s) }
+func rExeVal(s string) string  { return cHex("#AAAA7F", s) }
 func rMemVal(s string) string  { return cBg("#FFFFFF", "#00007F", s) }
-func rCmdVal(s string) string  { return cHexB("#00FFFF", s) }
-func rCpuVal(s string) string  { return cHexB("#0000FF", s) }
-func rUserVal(s string) string { return cHexB("#5555FF", s) }
-func rCwdVal(s string) string  { return cHexB("#FFAA7F", s) }
-func rCounter(s string) string { return cHexB("#55FF00", s) }
+func rCmdVal(s string) string  { return cHex("#00FFFF", s) }
+func rCpuVal(s string) string  { return cHex("#00AA00", s) }
+func rUserVal(s string) string { return cHex("#5555FF", s) }
+func rCwdVal(s string) string  { return cHex("#FFAA7F", s) }
+func rCounter(s string) string { return cHex("#55FF00", s) }
 func rParentLabel() string     { return cHexB("#FF00FF", "PARENT:") }
 func rChildLabel() string      { return cHexB("#00FF00", "CHILD:") }
 
@@ -159,10 +165,30 @@ func renderConn(c NetConn, isLast bool, indent string) string {
 	default:
 		typeStr = cBg("#FFFFFF", "#FF0000", "N/A")
 	}
-	laddr := cBg("#FFFFFF", "#005500", fmt.Sprintf("%s:%d", c.Laddr, c.Lport))
-	raddr := cBg("#AAFFFF", "#AA0000", fmt.Sprintf("%s:%d", c.Raddr, c.Rport))
+	// Format local addr — always has a port
+	laddrStr := fmt.Sprintf("%s:%d", c.Laddr, c.Lport)
+	laddr := cBg("#FFFFFF", "#005500", laddrStr)
+
+	// Format remote addr — show N/A:N/A when port is -1 (UDP / LISTEN with no remote)
+	var raddrStr string
+	if c.Rport == -1 || c.Raddr == "N/A" {
+		raddrStr = "N/A:N/A"
+	} else {
+		raddrStr = fmt.Sprintf("%s:%d", c.Raddr, c.Rport)
+	}
+	raddr := cBg("#AAFFFF", "#AA0000", raddrStr)
+
+	// family: show integer like Python (2=AF_INET, 23=AF_INET6) for exact parity
+	familyStr := c.Family
+	switch c.Family {
+	case "AF_INET":
+		familyStr = "2"
+	case "AF_INET6":
+		familyStr = "23"
+	}
+
 	return fmt.Sprintf("%s%s %s [local=%s] [remote=%s] (fd:%s, type:%s, family:%s) | STATUS: %s",
-		indent, chr, netIcon, laddr, raddr, c.Fd, typeStr, c.Family, statusStr)
+		indent, chr, netIcon, laddr, raddr, c.Fd, typeStr, familyStr, statusStr)
 }
 
 // ─── process info ─────────────────────────────────────────────────────────────

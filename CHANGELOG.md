@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [7.2.1] - 2026-04-30
+## [7.2.5] - 2026-04-30
 
 ### Added
 - Cross-platform Go port of Python pl11.py
