@@ -436,6 +436,88 @@ func printTable(rows [][]string, fields map[string]bool) {
 	fmt.Println(sep)
 }
 
+// ─── quick-view render functions ─────────────────────────────────────────────
+
+// renderModeExe: "001. /path/to/exe"
+func renderModeExe(idx int, info *ProcInfo) string {
+	return fmt.Sprintf("%s %s\n",
+		rCounter(fmt.Sprintf("%03d.", idx)),
+		rExeVal(info.Exe),
+	)
+}
+
+// renderModeCmd: "001. full command line..."
+func renderModeCmd(idx int, info *ProcInfo) string {
+	return fmt.Sprintf("%s %s\n",
+		rCounter(fmt.Sprintf("%03d.", idx)),
+		rCmdVal(info.Cmd),
+	)
+}
+
+// renderModeName: "001. chrome.exe [1234]"
+func renderModeName(idx int, info *ProcInfo) string {
+	return fmt.Sprintf("%s %s [%s]\n",
+		rCounter(fmt.Sprintf("%03d.", idx)),
+		rName(info.Name),
+		rPidBadge(fmt.Sprintf("%d", info.Pid)),
+	)
+}
+
+// renderModeMem: "001. chrome.exe (537.62 MB)"
+// with --percent: "001. chrome.exe (537.62 MB | 11585.07 MB / 4.64%)"
+func renderModeMem(idx int, info *ProcInfo, totalMem float64, percent bool) string {
+	memStr := cBg("#FFFFFF", "#00007F", fmt.Sprintf("%.2f MB", info.MemMB))
+	if percent && totalMem > 0 {
+		pct := info.MemMB / totalMem * 100
+		memStr = fmt.Sprintf("%s %s %s %s",
+			cBg("#FFFFFF", "#00007F", fmt.Sprintf("%.2f MB", info.MemMB)),
+			cHexB("#FF55FF", "|"),
+			cHexB("#FFFF00", fmt.Sprintf("%.2f MB", totalMem)),
+			cHexB("#00FFFF", fmt.Sprintf("/ %.2f%%", pct)),
+		)
+	}
+	return fmt.Sprintf("%s %s %s\n",
+		rCounter(fmt.Sprintf("%03d.", idx)),
+		rName(info.Name),
+		memStr,
+	)
+}
+
+// renderModeFlat: "001. chrome.exe [1234] (537.62 MB / 2.5%) [12 conns]"
+// with --time:    "001. 26/04/29 13:51:08:257  chrome.exe [1234] (537.62 MB / 2.5%) [12 conns] LIC-X\LICFACE"
+func renderModeFlat(idx int, info *ProcInfo, withTime bool) string {
+	pidPart  := fmt.Sprintf("[%s]", rPidBadge(fmt.Sprintf("%d", info.Pid)))
+	memPart  := cBg("#FFFFFF", "#00007F", fmt.Sprintf("%.2f MB", info.MemMB))
+	cpuPart  := cHexB("#0000FF", fmt.Sprintf("%.1f%%", info.CPU))
+	resource := fmt.Sprintf("(%s / %s)", memPart, cpuPart)
+
+	var connPart string
+	if len(info.Conns) > 0 {
+		connPart = " " + cBg("#FFFF00", "#005500", fmt.Sprintf(" %d port(s) ", len(info.Conns)))
+	}
+
+	if withTime {
+		timePart := cHexB("#AAAAAA", info.StartTime)
+		userPart := rUserVal(info.User)
+		return fmt.Sprintf("%s %s  %s %s %s%s  %s\n",
+			rCounter(fmt.Sprintf("%03d.", idx)),
+			timePart,
+			rName(info.Name),
+			pidPart,
+			resource,
+			connPart,
+			userPart,
+		)
+	}
+	return fmt.Sprintf("%s %s %s %s%s\n",
+		rCounter(fmt.Sprintf("%03d.", idx)),
+		rName(info.Name),
+		pidPart,
+		resource,
+		connPart,
+	)
+}
+
 // ─── list options ─────────────────────────────────────────────────────────────
 
 type ListOpts struct {
@@ -443,7 +525,8 @@ type ListOpts struct {
 	PidFilter   int32
 	UserFilter  string
 	MinMemMB    float64
-	ShowNetOnly bool
+	ShowNetOnly bool   // -n: show only procs WITH connections
+	ShowNets    bool   // -N: show connections per process (default OFF)
 	TableMode   bool
 	JSONMode    bool
 	LastN       int
@@ -458,6 +541,14 @@ type ListOpts struct {
 	NoTree      bool
 	TreeDepth   int
 	Fields      map[string]bool
+	// quick-view modes
+	ModeExe     bool // --exe  → index. exe_path
+	ModeCmd     bool // --cmd  → index. cmdline
+	ModeName    bool // --name → index. name [pid]
+	ModeMem     bool // --mem  → index. name (mem)  or  index. name (mem | X%)
+	ModePercent bool // --percent  (modifier for --mem)
+	ModeFlat    bool // --flat → index. name [pid] (mem/cpu%) [N ports]
+	ModeFlatTime bool // --flat --time → adds start_time and user
 }
 
 // ─── list processes ───────────────────────────────────────────────────────────
@@ -617,6 +708,39 @@ func listProcesses(opts ListOpts) {
 			continue
 		}
 
+		// ── quick-view modes: print immediately and move on ──────────────────
+		if opts.ModeExe {
+			fmt.Print(renderModeExe(counter, info))
+			totalMem += info.MemMB
+			counter++
+			continue
+		}
+		if opts.ModeCmd {
+			fmt.Print(renderModeCmd(counter, info))
+			totalMem += info.MemMB
+			counter++
+			continue
+		}
+		if opts.ModeName {
+			fmt.Print(renderModeName(counter, info))
+			totalMem += info.MemMB
+			counter++
+			continue
+		}
+		if opts.ModeMem {
+			// totalMem not yet final here; collect into entries for second pass
+			entries = append(entries, entry{counter, info, nil, nil})
+			totalMem += info.MemMB
+			counter++
+			continue
+		}
+		if opts.ModeFlat {
+			fmt.Print(renderModeFlat(counter, info, opts.ModeFlatTime))
+			totalMem += info.MemMB
+			counter++
+			continue
+		}
+
 		if opts.TableMode {
 			tableRows = append(tableRows, []string{
 				fmt.Sprintf("%03d", counter), name,
@@ -662,6 +786,14 @@ func listProcesses(opts ListOpts) {
 		return
 	}
 
+	// --mem second pass: totalMem is now final, render with optional %
+	if opts.ModeMem {
+		for _, e := range entries {
+			fmt.Print(renderModeMem(e.n, e.info, totalMem, opts.ModePercent))
+		}
+		goto summary
+	}
+
 	// Table output
 	if opts.TableMode {
 		printTable(tableRows, opts.Fields)
@@ -684,6 +816,8 @@ func listProcesses(opts ListOpts) {
 			fmt.Println()
 		}
 	}
+
+summary:
 
 	if counter > 1 {
 		fmt.Printf("\n📈 %s %s %s %s\n",
@@ -907,7 +1041,7 @@ func main() {
 			&cli.StringFlag{Name: "filter", Aliases: []string{"f"}, Usage: "Filter by process `NAME`, PID, or cmdline"},
 			&cli.IntFlag{Name: "port", Aliases: []string{"p"}, Usage: "Filter processes by `PORT` number (local or remote)"},
 			&cli.BoolFlag{Name: "list", Aliases: []string{"l"}, Usage: "List processes"},
-			&cli.BoolFlag{Name: "networks", Aliases: []string{"N"}, Usage: "Show network connections for each process"},
+			&cli.BoolFlag{Name: "networks", Aliases: []string{"N"}, Usage: "Show network connections per process (default: hidden)"},
 			&cli.BoolFlag{Name: "network", Aliases: []string{"n"}, Usage: "Show only processes with network connections"},
 			&cli.BoolFlag{Name: "table", Aliases: []string{"t"}, Usage: "Display in table format"},
 			&cli.IntFlag{Name: "last", Aliases: []string{"z"}, Usage: "Show last `N` started processes"},
@@ -931,6 +1065,14 @@ func main() {
 			&cli.IntFlag{Name: "watch", Aliases: []string{"w"}, Usage: "Auto-refresh every `N` seconds (watch mode)"},
 			&cli.StringFlag{Name: "fields", Usage: "Comma-separated fields: name,pid,exe,mem,cmd,cpu,user,cwd,net,start_time"},
 			&cli.BoolFlag{Name: "no-color", Usage: "Disable color output"},
+			// ── quick-view / display mode flags ──
+			&cli.BoolFlag{Name: "exe",     Usage: "Show only: index. exe_path"},
+			&cli.BoolFlag{Name: "cmd",     Usage: "Show only: index. full_cmdline"},
+			&cli.BoolFlag{Name: "name",    Usage: "Show only: index. name [pid]"},
+			&cli.BoolFlag{Name: "mem",     Usage: "Show only: index. name (mem)  — combine with --percent for usage %"},
+			&cli.BoolFlag{Name: "percent", Usage: "Modifier for --mem: show  index. name (mem | total/usage%)"},
+			&cli.BoolFlag{Name: "flat",    Usage: "Flat mode: index. name [pid] (mem/cpu%) [N ports]"},
+			&cli.BoolFlag{Name: "time",    Usage: "Modifier for --flat: add start_time and user to flat output"},
 		},
 		Action: func(c *cli.Context) error {
 			noColor = c.Bool("no-color")
@@ -949,26 +1091,57 @@ func main() {
 				portFilter > 0 || pidFilter > 0 || c.Bool("network") ||
 				c.Bool("networks") || lastN > 0
 
+			// -N (networks): show connections per process only when flag is passed.
+			// By default connections are hidden. If --fields was also passed and
+			// contains "net", that is respected as-is.
+			showNets := c.Bool("networks")
+			if showNets {
+				if fields == nil {
+					fields = map[string]bool{
+						"start_time": true, "name": true, "pid": true, "exe": true,
+						"mem": true, "cmd": true, "cpu": true, "user": true, "cwd": true, "net": true,
+					}
+				} else {
+					fields["net"] = true
+				}
+			} else if fields == nil {
+				// nil = show all fields except net (net only on -N)
+				fields = map[string]bool{
+					"start_time": true, "name": true, "pid": true, "exe": true,
+					"mem": true, "cmd": true, "cpu": true, "user": true, "cwd": true,
+				}
+			} else {
+				delete(fields, "net")
+			}
+
 			opts := ListOpts{
-				Filter:      filter,
-				PidFilter:   pidFilter,
-				UserFilter:  c.String("user"),
-				MinMemMB:    c.Float64("min-mem"),
-				ShowNetOnly: c.Bool("network"),
-				TableMode:   c.Bool("table"),
-				JSONMode:    c.Bool("json"),
-				LastN:       lastN,
-				SortDesc:    sortDesc,
-				NoFilterCmd: c.Bool("no-filter-cmd"),
-				SortMem:     c.Bool("sort-mem"),
-				PortFilter:  portFilter,
-				KillIt:      killIt && filter != "",
-				RestartIt:   restartIt && filter != "",
-				ShowParent:  c.Bool("show-parent"),
-				ShowChild:   c.Bool("show-child"),
-				NoTree:      c.Bool("no-tree"),
-				TreeDepth:   c.Int("depth"),
-				Fields:      fields,
+				Filter:       filter,
+				PidFilter:    pidFilter,
+				UserFilter:   c.String("user"),
+				MinMemMB:     c.Float64("min-mem"),
+				ShowNetOnly:  c.Bool("network"),
+				ShowNets:     showNets,
+				TableMode:    c.Bool("table"),
+				JSONMode:     c.Bool("json"),
+				LastN:        lastN,
+				SortDesc:     sortDesc,
+				NoFilterCmd:  c.Bool("no-filter-cmd"),
+				SortMem:      c.Bool("sort-mem"),
+				PortFilter:   portFilter,
+				KillIt:       killIt && filter != "",
+				RestartIt:    restartIt && filter != "",
+				ShowParent:   c.Bool("show-parent"),
+				ShowChild:    c.Bool("show-child"),
+				NoTree:       c.Bool("no-tree"),
+				TreeDepth:    c.Int("depth"),
+				Fields:       fields,
+				ModeExe:      c.Bool("exe"),
+				ModeCmd:      c.Bool("cmd"),
+				ModeName:     c.Bool("name"),
+				ModeMem:      c.Bool("mem"),
+				ModePercent:  c.Bool("percent"),
+				ModeFlat:     c.Bool("flat"),
+				ModeFlatTime: c.Bool("time"),
 			}
 			if c.Bool("all") {
 				opts.Filter = ""
