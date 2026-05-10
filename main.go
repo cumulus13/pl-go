@@ -541,6 +541,7 @@ type ListOpts struct {
 	NoTree      bool
 	TreeDepth   int
 	Fields      map[string]bool
+	Exceptions  []string // --exception / -e: exclude processes matching these names
 	// quick-view modes
 	ModeExe     bool // --exe  → index. exe_path
 	ModeCmd     bool // --cmd  → index. cmdline
@@ -671,6 +672,27 @@ func listProcesses(opts ListOpts) {
 			pidMatch := strings.Contains(pidStr, fl)
 			cmdMatch := !opts.NoFilterCmd && strings.Contains(strings.ToLower(cmd), fl)
 			if !nameMatch && !pidMatch && !cmdMatch {
+				continue
+			}
+		}
+
+		// exception filter: skip if name, pid, or cmdline matches any exception pattern
+		if len(opts.Exceptions) > 0 {
+			skip := false
+			pidStr := fmt.Sprintf("%d", p.Pid)
+			for _, ex := range opts.Exceptions {
+				el := strings.ToLower(strings.TrimSpace(ex))
+				if el == "" {
+					continue
+				}
+				if strings.Contains(strings.ToLower(name), el) ||
+					strings.Contains(pidStr, el) ||
+					strings.Contains(strings.ToLower(cmd), el) {
+					skip = true
+					break
+				}
+			}
+			if skip {
 				continue
 			}
 		}
@@ -933,20 +955,33 @@ func killProcess(filter string, lastN int, sortDesc bool, portFilter int, force 
 func restartProcess(p *process.Process) {
 	color.Yellow.Println("Attempting to restart process...\n")
 	n, _ := p.Name()
-	cmd, _ := p.Cmdline()
-	parts := strings.Fields(cmd)
-	if len(parts) == 0 {
-		color.Red.Printf("Cannot restart %s: no command line available.\n", n)
+
+	// Use exe path as the executable — avoids the quoted-path splitting problem
+	// that breaks strings.Fields() on paths like "C:\Program Files\...".
+	// CmdlineSlice() gives us correctly-parsed argv (handles Windows quoting).
+	exePath, err := p.Exe()
+	if err != nil || exePath == "" {
+		color.Red.Printf("Cannot restart %s: exe path unavailable.\n", n)
 		return
 	}
-	color.Cyan.Printf("Process: %s (PID %d)\nCommand: %s\n\n", n, p.Pid, cmd)
+	argSlice, _ := p.CmdlineSlice()
+	// argSlice[0] is the exe itself; pass the rest as arguments
+	var args []string
+	if len(argSlice) > 1 {
+		args = argSlice[1:]
+	}
+
+	cmd, _ := p.Cmdline()
+	color.Cyan.Printf("Process: %s (PID %d)\nEXE:     %s\nCommand: %s\n\n", n, p.Pid, exePath, cmd)
+
 	if err := p.Terminate(); err != nil {
 		color.Red.Printf("✗ Failed to terminate: %v\n", err)
 		return
 	}
 	time.Sleep(1 * time.Second)
 	color.Green.Println("✓ Process terminated")
-	newCmd := exec.Command(parts[0], parts[1:]...)
+
+	newCmd := exec.Command(exePath, args...)
 	newCmd.Stdout = os.Stdout
 	newCmd.Stderr = os.Stderr
 	if err := newCmd.Start(); err != nil {
@@ -1051,6 +1086,7 @@ func main() {
 			&cli.BoolFlag{Name: "kill", Aliases: []string{"k"}, Usage: "Terminate matching process (use with -f, -z 1, or -p)"},
 			&cli.BoolFlag{Name: "force", Usage: "Force kill all matching processes (use with -k -p)"},
 			&cli.BoolFlag{Name: "no-filter-cmd", Aliases: []string{"nfc"}, Usage: "Disable filtering by command line"},
+			&cli.StringSliceFlag{Name: "exception", Aliases: []string{"e"}, Usage: "Exclude processes matching `NAME/PID` — repeatable: -e chrome -e svchost"},
 			&cli.BoolFlag{Name: "sort-mem", Aliases: []string{"m"}, Usage: "Sort by memory usage (RSS)"},
 			&cli.BoolFlag{Name: "restart", Aliases: []string{"r"}, Usage: "Restart process (use with -f, -z 1, or -p)"},
 			&cli.BoolFlag{Name: "show-parent", Aliases: []string{"P"}, Usage: "Show parent process tree"},
@@ -1135,6 +1171,7 @@ func main() {
 				NoTree:       c.Bool("no-tree"),
 				TreeDepth:    c.Int("depth"),
 				Fields:       fields,
+				Exceptions:   c.StringSlice("exception"),
 				ModeExe:      c.Bool("exe"),
 				ModeCmd:      c.Bool("cmd"),
 				ModeName:     c.Bool("name"),
