@@ -1258,7 +1258,7 @@ func main() {
 	app := &cli.App{
 		Name:    "pl",
 		Usage:   "Process List Viewer",
-		Version: "7.2.11",
+		Version: "7.2.12",
 		Authors: []*cli.Author{
 			{Name: "Hadi Cahyadi", Email: "cumulus13@gmail.com"},
 		},
