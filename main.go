@@ -91,11 +91,26 @@ func rName(s string) string      { return cHexB("#00FFFF", s) }
 func rPidBadge(s string) string  { return cBg("#FFFFFF", "#55007F", s) }
 func rMemBadge(s string) string  { return cBg("#FF0000", "#FFAA7F", s) }
 func rUserBadge(s string) string { return cHex("#5555FF", s) }
-func rRunning(ok bool) string {
-	if ok {
+// func rRunning(ok bool) string {
+// 	if ok {
+// 		return cHex("#FFFF00", "(running)")
+// 	}
+// 	return cBg("#FFFFFF", "#FF0000", "???")
+// }
+func rStatus(status string) string {
+	switch strings.ToLower(status) {
+	case "running":
 		return cHex("#FFFF00", "(running)")
+
+	case "suspended":
+		return cBg("#000000", "#FFFF00", "(suspended)")
+
+	case "stopped":
+		return cBg("#FFFFFF", "#FF0000", "(stopped)")
+
+	default:
+		return cBg("#FFFFFF", "#550000", "(" + status + ")")
 	}
-	return cBg("#FFFFFF", "#FF0000", "???")
 }
 func rNameVal(s string) string { return cHex("#00AAFF", s) }
 func rPidVal(s string) string  { return cBg("#FFFFFF", "#550000", s) }
@@ -205,6 +220,7 @@ type ProcInfo struct {
 	Running   bool      `json:"running"`
 	StartTime string    `json:"start_time"`
 	Conns     []NetConn `json:"connections"`
+	Status    string    `json:"status"`
 }
 
 func gather(p *process.Process) (*ProcInfo, error) {
@@ -220,6 +236,7 @@ func gather(p *process.Process) (*ProcInfo, error) {
 	cpu, _ := p.CPUPercent()
 	running, _ := p.IsRunning()
 	ct, _ := p.CreateTime()
+	status := getProcessStatus(p.Pid)
 
 	// Platform-aware CMD/CWD resolution:
 	// On Windows, sandboxed processes (Chrome renderers, etc.) block gopsutil's
@@ -234,6 +251,7 @@ func gather(p *process.Process) (*ProcInfo, error) {
 		MemMB:     float64(mem.RSS) / 1024 / 1024,
 		CPU:       cpu,
 		Running:   running,
+		Status:    status,
 		StartTime: fmtStartTimeMS(ct), // platform-specific, includes milliseconds
 		Conns:     getConnections(p.Pid),
 	}, nil
@@ -248,11 +266,13 @@ func fieldEnabled(fields map[string]bool, name string) bool {
 
 func renderBlock(info *ProcInfo, prefix, detailPrefix string, fields map[string]bool) string {
 	var sb strings.Builder
+	
 	sb.WriteString(fmt.Sprintf("%s%s [%s] %s %s %s\n",
 		prefix,
 		rName(info.Name), rPidBadge(fmt.Sprintf("%d", info.Pid)),
 		rMemBadge(fmt.Sprintf("%.2f MB", info.MemMB)),
-		rUserBadge(info.User), rRunning(info.Running),
+		// rUserBadge(info.User), rRunning(info.Running),
+		rUserBadge(info.User), rStatus(info.Status),
 	))
 	if fieldEnabled(fields, "start_time") && info.StartTime != "" {
 		sb.WriteString(fmt.Sprintf("%sSTART_TIME : %s\n", detailPrefix, info.StartTime))
@@ -550,6 +570,8 @@ type ListOpts struct {
 	ModePercent bool // --percent  (modifier for --mem)
 	ModeFlat    bool // --flat → index. name [pid] (mem/cpu%) [N ports]
 	ModeFlatTime bool // --flat --time → adds start_time and user
+	SuspendIt    bool
+	ResumeIt     bool
 }
 
 // ─── list processes ───────────────────────────────────────────────────────────
@@ -703,6 +725,7 @@ func listProcesses(opts ListOpts) {
 		}
 
 		info, err := gather(p)
+		// fmt.Printf("info: %v\n", info)
 		if err != nil {
 			// Print error inline like Python — process died mid-scan
 			ct2, _ := p.CreateTime()
@@ -797,6 +820,10 @@ func listProcesses(opts ListOpts) {
 			}
 		} else if opts.RestartIt {
 			restartProcess(p)
+		} else if opts.SuspendIt {
+			doSuspend(p)
+		} else if opts.ResumeIt {
+			doResume(p)
 		}
 	}
 
@@ -1047,6 +1074,161 @@ func restartByFilter(filter string, lastN int, sortDesc bool, portFilter int) {
 	color.Red.Println("No matching process found to restart.")
 }
 
+// doSuspend suspends a single process and prints a status line.
+func doSuspend(p *process.Process) {
+	n, _ := p.Name()
+	color.Yellow.Printf("\nAttempting to suspend:\n  Name: %s\n  PID:  %d\n", n, p.Pid)
+	if err := suspendProcess(p.Pid); err != nil {
+		color.Red.Printf("✗ Failed: %v\n", err)
+		return
+	}
+	fmt.Printf("⏸  %s %s %s\n",
+		cHexB("#00FFFF", "Suspended"),
+		cHexB("#FF007F", n),
+		cHexB("#FFFF00", fmt.Sprintf("PID %d", p.Pid)),
+	)
+}
+
+// doResume resumes a single previously-suspended process.
+func doResume(p *process.Process) {
+	n, _ := p.Name()
+	color.Yellow.Printf("\nAttempting to resume:\n  Name: %s\n  PID:  %d\n", n, p.Pid)
+	if err := resumeProcess(p.Pid); err != nil {
+		color.Red.Printf("✗ Failed: %v\n", err)
+		return
+	}
+	fmt.Printf("▶  %s %s %s\n",
+		cHexB("#00FF00", "Resumed"),
+		cHexB("#FF007F", n),
+		cHexB("#FFFF00", fmt.Sprintf("PID %d", p.Pid)),
+	)
+}
+
+// suspendByFilter finds processes matching filter/lastN/portFilter and suspends them.
+// Multiple matches are all suspended (unlike kill which requires --force for ports).
+func suspendByFilter(filter string, lastN int, sortDesc bool, portFilter int) {
+	allProcs, _ := getAllProcesses()
+
+	if portFilter > 0 {
+		var matched []*process.Process
+		for _, p := range allProcs {
+			if checkPort(p.Pid, portFilter) {
+				matched = append(matched, p)
+			}
+		}
+		if len(matched) == 0 {
+			color.Red.Printf("No process found using port %d\n", portFilter)
+			return
+		}
+		for _, p := range matched {
+			doSuspend(p)
+		}
+		return
+	}
+
+	type pt struct {
+		p  *process.Process
+		ct int64
+	}
+	var srt []pt
+	for _, p := range allProcs {
+		ct, _ := p.CreateTime()
+		srt = append(srt, pt{p, ct})
+	}
+	sort.Slice(srt, func(i, j int) bool {
+		if sortDesc {
+			return srt[i].ct > srt[j].ct
+		}
+		return srt[i].ct < srt[j].ct
+	})
+
+	fl := strings.ToLower(filter)
+	found := false
+	for _, item := range srt {
+		n, _ := item.p.Name()
+		cmd, _ := item.p.Cmdline()
+		if fl != "" && (strings.Contains(strings.ToLower(n), fl) ||
+			strings.Contains(strings.ToLower(cmd), fl)) {
+			doSuspend(item.p)
+			found = true
+			// suspend ALL matches, not just first
+		}
+	}
+	if !found {
+		if lastN == 1 && len(srt) > 0 {
+			if sortDesc {
+				doSuspend(srt[0].p)
+			} else {
+				doSuspend(srt[len(srt)-1].p)
+			}
+			return
+		}
+		color.Red.Println("No matching process found to suspend.")
+	}
+}
+
+// resumeByFilter finds processes matching filter/lastN/portFilter and resumes them.
+func resumeByFilter(filter string, lastN int, sortDesc bool, portFilter int) {
+	allProcs, _ := getAllProcesses()
+
+	if portFilter > 0 {
+		var matched []*process.Process
+		for _, p := range allProcs {
+			if checkPort(p.Pid, portFilter) {
+				matched = append(matched, p)
+			}
+		}
+		if len(matched) == 0 {
+			color.Red.Printf("No process found using port %d\n", portFilter)
+			return
+		}
+		for _, p := range matched {
+			doResume(p)
+		}
+		return
+	}
+
+	type pt struct {
+		p  *process.Process
+		ct int64
+	}
+	var srt []pt
+	for _, p := range allProcs {
+		ct, _ := p.CreateTime()
+		srt = append(srt, pt{p, ct})
+	}
+	sort.Slice(srt, func(i, j int) bool {
+		if sortDesc {
+			return srt[i].ct > srt[j].ct
+		}
+		return srt[i].ct < srt[j].ct
+	})
+
+	fl := strings.ToLower(filter)
+	found := false
+	for _, item := range srt {
+		n, _ := item.p.Name()
+		cmd, _ := item.p.Cmdline()
+		if fl != "" && (strings.Contains(strings.ToLower(n), fl) ||
+			strings.Contains(strings.ToLower(cmd), fl)) {
+			doResume(item.p)
+			found = true
+		}
+	}
+	if !found {
+		if lastN == 1 && len(srt) > 0 {
+			if sortDesc {
+				doResume(srt[0].p)
+			} else {
+				doResume(srt[len(srt)-1].p)
+			}
+			return
+		}
+		color.Red.Println("No matching process found to resume.")
+	}
+}
+
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 func parseFields(raw string) map[string]bool {
@@ -1089,6 +1271,17 @@ func main() {
 			&cli.StringSliceFlag{Name: "exception", Aliases: []string{"e"}, Usage: "Exclude processes matching `NAME/PID` — repeatable: -e chrome -e svchost"},
 			&cli.BoolFlag{Name: "sort-mem", Aliases: []string{"m"}, Usage: "Sort by memory usage (RSS)"},
 			&cli.BoolFlag{Name: "restart", Aliases: []string{"r"}, Usage: "Restart process (use with -f, -z 1, or -p)"},
+			&cli.BoolFlag{
+				Name:    "suspend",
+				Aliases: []string{"sp"},
+				Usage:   "Suspend (freeze) matching process(es) — use with -f, -z 1, or -p",
+			},
+			&cli.BoolFlag{
+				Name:    "resume",
+				Aliases: []string{"pp", "unsuspend"},
+				Usage:   "Resume (unfreeze) matching process(es) — use with -f, -z 1, or -p",
+			},
+
 			&cli.BoolFlag{Name: "show-parent", Aliases: []string{"P"}, Usage: "Show parent process tree"},
 			&cli.BoolFlag{Name: "show-child", Aliases: []string{"C"}, Usage: "Show child process tree"},
 			// ── new flags ──
@@ -1120,6 +1313,8 @@ func main() {
 			lastN := c.Int("last")
 			killIt := c.Bool("kill")
 			restartIt := c.Bool("restart")
+			suspendIt := c.Bool("suspend")
+			resumeIt  := c.Bool("resume")
 			watchSec := c.Int("watch")
 			fields := parseFields(c.String("fields"))
 
@@ -1166,6 +1361,8 @@ func main() {
 				PortFilter:   portFilter,
 				KillIt:       killIt && filter != "",
 				RestartIt:    restartIt && filter != "",
+				SuspendIt:    c.Bool("suspend") && filter != "",
+				ResumeIt:     c.Bool("resume") && filter != "",
 				ShowParent:   c.Bool("show-parent"),
 				ShowChild:    c.Bool("show-child"),
 				NoTree:       c.Bool("no-tree"),
@@ -1199,8 +1396,16 @@ func main() {
 			if restartIt && (lastN == 1 || (portFilter > 0 && filter == "")) {
 				restartByFilter(filter, lastN, sortDesc, portFilter)
 			}
+			if suspendIt && (lastN == 1 || (portFilter > 0 && filter == "")) {
+				suspendByFilter(filter, lastN, sortDesc, portFilter)
+			}
+			if resumeIt && (lastN == 1 || (portFilter > 0 && filter == "")) {
+				resumeByFilter(filter, lastN, sortDesc, portFilter)
+			}
 
-			if !doList && !killIt && !restartIt && watchSec == 0 {
+
+			// if !doList && !killIt && !restartIt && watchSec == 0 {
+			if !doList && !killIt && !restartIt && !suspendIt && !resumeIt && watchSec == 0 {
 				cli.ShowAppHelp(c)
 				color.Red.Println("\nKill (-k) / Restart (-r) only allowed with -f, -z 1, or -p")
 			}

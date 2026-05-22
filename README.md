@@ -328,6 +328,17 @@ pl -l -a -j | jq '.[] | {pid, name, mem_mb}'
 pl -l -a --no-color
 ```
 
+### Suspend & Resume Process
+
+```bash
+# Suspend Process by filter
+pl -f growl -sp
+
+# Resumr Process by filter on Suspend or not
+pl -f growl -pp
+
+```
+
 ---
 
 ## JSON output schema
@@ -465,4 +476,4 @@ GOOS=windows GOARCH=386    go build -ldflags="-s -w" -o dist/pl-windows-386.exe 
 
 ## License
 
-[MIT](_LICENSE)
+[MIT @ Hadi Cahyadi](LICENSE)
