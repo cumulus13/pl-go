@@ -1245,10 +1245,20 @@ func parseFields(raw string) map[string]bool {
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
 func main() {
+
+	cli.VersionPrinter = func(c *cli.Context) {
+		fmt.Printf(
+			"%s version %s %s <%s>\n",
+			c.App.Name,
+			c.App.Version,
+			c.App.Authors[0].Name,
+			c.App.Authors[0].Email,
+		)
+	}
 	app := &cli.App{
 		Name:    "pl",
 		Usage:   "Process List Viewer",
-		Version: "7.2.10",
+		Version: "7.2.11",
 		Authors: []*cli.Author{
 			{Name: "Hadi Cahyadi", Email: "cumulus13@gmail.com"},
 		},
