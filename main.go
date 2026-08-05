@@ -1328,6 +1328,24 @@ func main() {
 			watchSec := c.Int("watch")
 			fields := parseFields(c.String("fields"))
 
+			// `-n NUMBER` (space-separated, e.g. `pl -n 8080`): -n/--network is
+			// a bare boolean flag, so Go's flag parser leaves a trailing "8080"
+			// as a plain (non-flag) argument instead of consuming it as -n's
+			// value. Pick it up here: if -n was passed with no explicit -p/--port
+			// and a positive-integer argument follows, treat it as the port to
+			// filter by and also switch on -N (network detail) automatically —
+			// i.e. `pl -n 8080` behaves like `pl -p 8080 -n -N`.
+			// Note: -f/--filter is untouched by this — `pl -f 80 -n` keeps its
+			// original meaning (filter by name/PID/cmdline containing "80",
+			// then narrowed to processes that have any network connection).
+			forceShowNets := false
+			if c.Bool("network") && portFilter == 0 && c.Args().Len() > 0 {
+				if pv, err := strconv.Atoi(c.Args().First()); err == nil && pv > 0 {
+					portFilter = pv
+					forceShowNets = true
+				}
+			}
+
 			doList := c.Bool("list") || c.Bool("all") || filter != "" ||
 				portFilter > 0 || pidFilter > 0 || c.Bool("network") ||
 				c.Bool("networks") || lastN > 0
@@ -1335,7 +1353,7 @@ func main() {
 			// -N (networks): show connections per process only when flag is passed.
 			// By default connections are hidden. If --fields was also passed and
 			// contains "net", that is respected as-is.
-			showNets := c.Bool("networks")
+			showNets := c.Bool("networks") || forceShowNets
 			if showNets {
 				if fields == nil {
 					fields = map[string]bool{
